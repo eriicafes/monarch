@@ -26,11 +26,14 @@
 //	    "go.mongodb.org/mongo-driver/v2/mongo/options"
 //	)
 //
+//	// Inject database into context (db is *mongo.Database)
+//	ctx = monarch.WithContext(ctx, db)
+//
 //	// Find with native bson filters
-//	users, err := Users.Find(ctx, db, bson.M{"status": "active"})
+//	users, err := Users.Find(ctx, bson.M{"status": "active"})
 //
 //	// Update with native bson operations
-//	result, err := Users.UpdateOne(ctx, db,
+//	result, err := Users.UpdateOne(ctx,
 //	    bson.M{"_id": "user123"},
 //	    bson.D{
 //	        {"$set", bson.M{"status": "inactive"}},
@@ -39,17 +42,10 @@
 //	)
 //
 //	// Use native options
-//	users, err := Users.Find(ctx, db,
+//	users, err := Users.Find(ctx,
 //	    bson.M{"age": bson.M{"$gte": 18}},
 //	    options.Find().SetLimit(10).SetSort(bson.D{{"createdAt", -1}}),
 //	)
-//
-// # BoundCollection
-//
-// For cleaner code, bind the database once:
-//
-//	users := monarch.Bind(db, Users)
-//	results, err := users.Find(ctx, bson.M{"status": "active"})
 //
 // # Type Transformation
 //
@@ -69,7 +65,7 @@
 //	    }},
 //	}
 //
-//	stats, err := monarch.AggregateAs[UserStats](ctx, db, Users, pipeline)
+//	stats, err := monarch.AggregateAs[UserStats](ctx, Users, pipeline)
 //
 // Similarly, use FindAs, FindSeqAs, and FindOneAs for projections that
 // change the document structure.
@@ -78,7 +74,7 @@
 //
 // All MongoDB driver errors pass through unchanged:
 //
-//	user, err := Users.FindOne(ctx, db, bson.M{"_id": "nonexistent"})
+//	user, err := Users.FindOne(ctx, bson.M{"_id": "nonexistent"})
 //	if errors.Is(err, mongo.ErrNoDocuments) {
 //	    // Handle not found
 //	}
@@ -87,7 +83,7 @@
 //
 // Use FindSeq for memory-efficient iteration over large result sets:
 //
-//	for user, err := range Users.FindSeq(ctx, db, bson.M{"status": "active"}) {
+//	for user, err := range Users.FindSeq(ctx, bson.M{"status": "active"}) {
 //	    if err != nil {
 //	        // Handle error, continue or break as needed
 //	        continue
@@ -98,11 +94,31 @@ package monarch
 
 import (
 	"context"
+	"errors"
 	"iter"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
+
+// ErrNoDatabase is returned when a database instance is not found in the context.
+var ErrNoDatabase = errors.New("monarch: database not found in context")
+
+type contextKey struct{}
+
+// WithContext returns a new context with the database instance attached.
+func WithContext(ctx context.Context, db *mongo.Database) context.Context {
+	return context.WithValue(ctx, contextKey{}, db)
+}
+
+// getDB retrieves the database instance from the context.
+func getDB(ctx context.Context) (*mongo.Database, error) {
+	db, ok := ctx.Value(contextKey{}).(*mongo.Database)
+	if !ok || db == nil {
+		return nil, ErrNoDatabase
+	}
+	return db, nil
+}
 
 // Collection represents a type-safe MongoDB collection.
 //
@@ -121,7 +137,11 @@ type Collection[T any] string
 // Options can be provided using the native mongo/options package.
 //
 // See [mongo.Collection.Find] for more details.
-func (c Collection[T]) Find(ctx context.Context, db *mongo.Database, filter any, opts ...options.Lister[options.FindOptions]) ([]T, error) {
+func (c Collection[T]) Find(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) ([]T, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
 	collection := db.Collection(string(c))
 	cursor, err := collection.Find(ctx, filter, opts...)
 	if err != nil {
@@ -144,8 +164,14 @@ func (c Collection[T]) Find(ctx context.Context, db *mongo.Database, filter any,
 // true to continue or false to stop.
 //
 // See [mongo.Collection.Find] for more details on the underlying operation.
-func (c Collection[T]) FindSeq(ctx context.Context, db *mongo.Database, filter any, opts ...options.Lister[options.FindOptions]) iter.Seq2[T, error] {
+func (c Collection[T]) FindSeq(ctx context.Context, filter any, opts ...options.Lister[options.FindOptions]) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
+		db, err := getDB(ctx)
+		if err != nil {
+			var zero T
+			yield(zero, err)
+			return
+		}
 		collection := db.Collection(string(c))
 		cursor, err := collection.Find(ctx, filter, opts...)
 		if err != nil {
@@ -177,10 +203,14 @@ func (c Collection[T]) FindSeq(ctx context.Context, db *mongo.Database, filter a
 // according to the collection's natural order or the sort order if specified in options.
 //
 // See [mongo.Collection.FindOne] for more details.
-func (c Collection[T]) FindOne(ctx context.Context, db *mongo.Database, filter any, opts ...options.Lister[options.FindOneOptions]) (T, error) {
+func (c Collection[T]) FindOne(ctx context.Context, filter any, opts ...options.Lister[options.FindOneOptions]) (T, error) {
 	var result T
+	db, err := getDB(ctx)
+	if err != nil {
+		return result, err
+	}
 	collection := db.Collection(string(c))
-	err := collection.FindOne(ctx, filter, opts...).Decode(&result)
+	err = collection.FindOne(ctx, filter, opts...).Decode(&result)
 	return result, err
 }
 
@@ -195,10 +225,14 @@ func (c Collection[T]) FindOne(ctx context.Context, db *mongo.Database, filter a
 // Use FindOneAndReplace if you want to replace the entire document.
 //
 // See [mongo.Collection.FindOneAndUpdate] for more details.
-func (c Collection[T]) FindOneAndUpdate(ctx context.Context, db *mongo.Database, filter any, update any, opts ...options.Lister[options.FindOneAndUpdateOptions]) (T, error) {
+func (c Collection[T]) FindOneAndUpdate(ctx context.Context, filter any, update any, opts ...options.Lister[options.FindOneAndUpdateOptions]) (T, error) {
 	var result T
+	db, err := getDB(ctx)
+	if err != nil {
+		return result, err
+	}
 	collection := db.Collection(string(c))
-	err := collection.FindOneAndUpdate(ctx, filter, update, opts...).Decode(&result)
+	err = collection.FindOneAndUpdate(ctx, filter, update, opts...).Decode(&result)
 	return result, err
 }
 
@@ -213,10 +247,14 @@ func (c Collection[T]) FindOneAndUpdate(ctx context.Context, db *mongo.Database,
 // if you want to use update operators.
 //
 // See [mongo.Collection.FindOneAndReplace] for more details.
-func (c Collection[T]) FindOneAndReplace(ctx context.Context, db *mongo.Database, filter any, replacement T, opts ...options.Lister[options.FindOneAndReplaceOptions]) (T, error) {
+func (c Collection[T]) FindOneAndReplace(ctx context.Context, filter any, replacement T, opts ...options.Lister[options.FindOneAndReplaceOptions]) (T, error) {
 	var result T
+	db, err := getDB(ctx)
+	if err != nil {
+		return result, err
+	}
 	collection := db.Collection(string(c))
-	err := collection.FindOneAndReplace(ctx, filter, replacement, opts...).Decode(&result)
+	err = collection.FindOneAndReplace(ctx, filter, replacement, opts...).Decode(&result)
 	return result, err
 }
 
@@ -227,10 +265,14 @@ func (c Collection[T]) FindOneAndReplace(ctx context.Context, db *mongo.Database
 // Returns mongo.ErrNoDocuments if no document matches the filter.
 //
 // See [mongo.Collection.FindOneAndDelete] for more details.
-func (c Collection[T]) FindOneAndDelete(ctx context.Context, db *mongo.Database, filter any, opts ...options.Lister[options.FindOneAndDeleteOptions]) (T, error) {
+func (c Collection[T]) FindOneAndDelete(ctx context.Context, filter any, opts ...options.Lister[options.FindOneAndDeleteOptions]) (T, error) {
 	var result T
+	db, err := getDB(ctx)
+	if err != nil {
+		return result, err
+	}
 	collection := db.Collection(string(c))
-	err := collection.FindOneAndDelete(ctx, filter, opts...).Decode(&result)
+	err = collection.FindOneAndDelete(ctx, filter, opts...).Decode(&result)
 	return result, err
 }
 
@@ -240,7 +282,11 @@ func (c Collection[T]) FindOneAndDelete(ctx context.Context, db *mongo.Database,
 // Returns the inserted document's ID in InsertOneResult.InsertedID.
 //
 // See [mongo.Collection.InsertOne] for more details.
-func (c Collection[T]) InsertOne(ctx context.Context, db *mongo.Database, value T, opts ...options.Lister[options.InsertOneOptions]) (*mongo.InsertOneResult, error) {
+func (c Collection[T]) InsertOne(ctx context.Context, value T, opts ...options.Lister[options.InsertOneOptions]) (*mongo.InsertOneResult, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
 	collection := db.Collection(string(c))
 	return collection.InsertOne(ctx, value, opts...)
 }
@@ -255,7 +301,11 @@ func (c Collection[T]) InsertOne(ctx context.Context, db *mongo.Database, value 
 // inserting even if one document fails.
 //
 // See [mongo.Collection.InsertMany] for more details.
-func (c Collection[T]) InsertMany(ctx context.Context, db *mongo.Database, values []T, opts ...options.Lister[options.InsertManyOptions]) (*mongo.InsertManyResult, error) {
+func (c Collection[T]) InsertMany(ctx context.Context, values []T, opts ...options.Lister[options.InsertManyOptions]) (*mongo.InsertManyResult, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
 	collection := db.Collection(string(c))
 	docs := make([]any, len(values))
 	for i, v := range values {
@@ -274,7 +324,11 @@ func (c Collection[T]) InsertMany(ctx context.Context, db *mongo.Database, value
 // Use options.UpdateOne().SetUpsert(true) to insert a new document if no match is found.
 //
 // See [mongo.Collection.UpdateOne] for more details.
-func (c Collection[T]) UpdateOne(ctx context.Context, db *mongo.Database, filter any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error) {
+func (c Collection[T]) UpdateOne(ctx context.Context, filter any, update any, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
 	collection := db.Collection(string(c))
 	return collection.UpdateOne(ctx, filter, update, opts...)
 }
@@ -286,7 +340,11 @@ func (c Collection[T]) UpdateOne(ctx context.Context, db *mongo.Database, filter
 // ModifiedCount (number of documents actually changed) fields.
 //
 // See [mongo.Collection.UpdateMany] for more details.
-func (c Collection[T]) UpdateMany(ctx context.Context, db *mongo.Database, filter any, update any, opts ...options.Lister[options.UpdateManyOptions]) (*mongo.UpdateResult, error) {
+func (c Collection[T]) UpdateMany(ctx context.Context, filter any, update any, opts ...options.Lister[options.UpdateManyOptions]) (*mongo.UpdateResult, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
 	collection := db.Collection(string(c))
 	return collection.UpdateMany(ctx, filter, update, opts...)
 }
@@ -301,7 +359,11 @@ func (c Collection[T]) UpdateMany(ctx context.Context, db *mongo.Database, filte
 // Use options.Replace().SetUpsert(true) to insert the replacement if no match is found.
 //
 // See [mongo.Collection.ReplaceOne] for more details.
-func (c Collection[T]) ReplaceOne(ctx context.Context, db *mongo.Database, filter any, replacement T, opts ...options.Lister[options.ReplaceOptions]) (*mongo.UpdateResult, error) {
+func (c Collection[T]) ReplaceOne(ctx context.Context, filter any, replacement T, opts ...options.Lister[options.ReplaceOptions]) (*mongo.UpdateResult, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
 	collection := db.Collection(string(c))
 	return collection.ReplaceOne(ctx, filter, replacement, opts...)
 }
@@ -315,7 +377,11 @@ func (c Collection[T]) ReplaceOne(ctx context.Context, db *mongo.Database, filte
 // deleted (0 or 1).
 //
 // See [mongo.Collection.DeleteOne] for more details.
-func (c Collection[T]) DeleteOne(ctx context.Context, db *mongo.Database, filter any, opts ...options.Lister[options.DeleteOneOptions]) (*mongo.DeleteResult, error) {
+func (c Collection[T]) DeleteOne(ctx context.Context, filter any, opts ...options.Lister[options.DeleteOneOptions]) (*mongo.DeleteResult, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
 	collection := db.Collection(string(c))
 	return collection.DeleteOne(ctx, filter, opts...)
 }
@@ -326,7 +392,11 @@ func (c Collection[T]) DeleteOne(ctx context.Context, db *mongo.Database, filter
 // Returns DeleteResult with DeletedCount field indicating how many documents were deleted.
 //
 // See [mongo.Collection.DeleteMany] for more details.
-func (c Collection[T]) DeleteMany(ctx context.Context, db *mongo.Database, filter any, opts ...options.Lister[options.DeleteManyOptions]) (*mongo.DeleteResult, error) {
+func (c Collection[T]) DeleteMany(ctx context.Context, filter any, opts ...options.Lister[options.DeleteManyOptions]) (*mongo.DeleteResult, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
 	collection := db.Collection(string(c))
 	return collection.DeleteMany(ctx, filter, opts...)
 }
@@ -341,7 +411,11 @@ func (c Collection[T]) DeleteMany(ctx context.Context, db *mongo.Database, filte
 // the entire collection.
 //
 // See [mongo.Collection.CountDocuments] for more details.
-func (c Collection[T]) CountDocuments(ctx context.Context, db *mongo.Database, filter any, opts ...options.Lister[options.CountOptions]) (int64, error) {
+func (c Collection[T]) CountDocuments(ctx context.Context, filter any, opts ...options.Lister[options.CountOptions]) (int64, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return 0, err
+	}
 	collection := db.Collection(string(c))
 	return collection.CountDocuments(ctx, filter, opts...)
 }
@@ -356,7 +430,11 @@ func (c Collection[T]) CountDocuments(ctx context.Context, db *mongo.Database, f
 // returns all documents in the collection.
 //
 // See [mongo.Collection.Aggregate] for more details.
-func (c Collection[T]) Aggregate(ctx context.Context, db *mongo.Database, pipeline any, opts ...options.Lister[options.AggregateOptions]) ([]T, error) {
+func (c Collection[T]) Aggregate(ctx context.Context, pipeline any, opts ...options.Lister[options.AggregateOptions]) ([]T, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
 	collection := db.Collection(string(c))
 	cursor, err := collection.Aggregate(ctx, pipeline, opts...)
 	if err != nil {
@@ -381,7 +459,11 @@ func (c Collection[T]) Aggregate(ctx context.Context, db *mongo.Database, pipeli
 // structure than the collection's base type T.
 //
 // See [mongo.Collection.Aggregate] for more details.
-func AggregateAs[R, T any](ctx context.Context, db *mongo.Database, c Collection[T], pipeline any, opts ...options.Lister[options.AggregateOptions]) ([]R, error) {
+func AggregateAs[R, T any](ctx context.Context, c Collection[T], pipeline any, opts ...options.Lister[options.AggregateOptions]) ([]R, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
 	collection := db.Collection(string(c))
 	cursor, err := collection.Aggregate(ctx, pipeline, opts...)
 	if err != nil {
@@ -405,7 +487,11 @@ func AggregateAs[R, T any](ctx context.Context, db *mongo.Database, c Collection
 // fields, resulting in a different structure than the collection's base type T.
 //
 // See [mongo.Collection.Find] for more details.
-func FindAs[R, T any](ctx context.Context, db *mongo.Database, c Collection[T], filter any, opts ...options.Lister[options.FindOptions]) ([]R, error) {
+func FindAs[R, T any](ctx context.Context, c Collection[T], filter any, opts ...options.Lister[options.FindOptions]) ([]R, error) {
+	db, err := getDB(ctx)
+	if err != nil {
+		return nil, err
+	}
 	collection := db.Collection(string(c))
 	cursor, err := collection.Find(ctx, filter, opts...)
 	if err != nil {
@@ -429,8 +515,14 @@ func FindAs[R, T any](ctx context.Context, db *mongo.Database, c Collection[T], 
 // for large result sets with projected fields.
 //
 // See [mongo.Collection.Find] for more details.
-func FindSeqAs[R, T any](ctx context.Context, db *mongo.Database, c Collection[T], filter any, opts ...options.Lister[options.FindOptions]) iter.Seq2[R, error] {
+func FindSeqAs[R, T any](ctx context.Context, c Collection[T], filter any, opts ...options.Lister[options.FindOptions]) iter.Seq2[R, error] {
 	return func(yield func(R, error) bool) {
+		db, err := getDB(ctx)
+		if err != nil {
+			var zero R
+			yield(zero, err)
+			return
+		}
 		collection := db.Collection(string(c))
 		cursor, err := collection.Find(ctx, filter, opts...)
 		if err != nil {
@@ -465,9 +557,29 @@ func FindSeqAs[R, T any](ctx context.Context, db *mongo.Database, c Collection[T
 // fields for a single document.
 //
 // See [mongo.Collection.FindOne] for more details.
-func FindOneAs[R, T any](ctx context.Context, db *mongo.Database, c Collection[T], filter any, opts ...options.Lister[options.FindOneOptions]) (R, error) {
+func FindOneAs[R, T any](ctx context.Context, c Collection[T], filter any, opts ...options.Lister[options.FindOneOptions]) (R, error) {
 	var result R
+	db, err := getDB(ctx)
+	if err != nil {
+		return result, err
+	}
 	collection := db.Collection(string(c))
-	err := collection.FindOne(ctx, filter, opts...).Decode(&result)
+	err = collection.FindOne(ctx, filter, opts...).Decode(&result)
 	return result, err
+}
+
+// WithTransaction executes a transaction with a typed return value.
+//
+// See [mongo.Session.WithTransaction] for more details.
+func WithTransaction[T any](ctx context.Context, session *mongo.Session, fn func(ctx context.Context) (result T, err error), opts ...options.Lister[options.TransactionOptions]) (T, error) {
+	val, err := session.WithTransaction(ctx, func(ctx context.Context) (any, error) {
+		return fn(ctx)
+	}, opts...)
+
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+
+	return val.(T), nil
 }
