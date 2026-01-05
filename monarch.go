@@ -114,7 +114,7 @@ func WithContext(ctx context.Context, db *mongo.Database) context.Context {
 // getDB retrieves the database instance from the context.
 func getDB(ctx context.Context) (*mongo.Database, error) {
 	db, ok := ctx.Value(contextKey{}).(*mongo.Database)
-	if !ok || db == nil {
+	if !ok {
 		return nil, ErrNoDatabase
 	}
 	return db, nil
